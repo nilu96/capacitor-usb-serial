@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+      The plugin itself declares no USB host feature requirement so it can be installed
+      on devices without USB host support (calls simply find no devices). Consuming apps
+      that REQUIRE USB host may add:
+        <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+
+      Optional auto-attach: a consuming app adds an intent-filter for
+      android.hardware.usb.action.USB_DEVICE_ATTACHED on its main Activity plus a
+      meta-data pointing at res/xml/device_filter.xml. See README / device_filter.xml.
+    -->
+</manifest>

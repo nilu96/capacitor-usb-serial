@@ -1,0 +1,387 @@
+package com.capacitorusbserial.plugin
+
+import android.content.Context
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbManager
+import com.getcapacitor.JSObject
+import com.hoho.android.usbserial.driver.FtdiSerialDriver
+import com.hoho.android.usbserial.driver.UsbSerialPort
+import com.hoho.android.usbserial.driver.UsbSerialProber
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.anyInt
+import org.mockito.MockedStatic
+import org.mockito.Mockito.mock
+import org.mockito.Mockito.mockStatic
+import org.mockito.Mockito.verify
+import org.mockito.Mockito.`when`
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+import java.io.IOException
+import java.util.EnumSet
+
+/**
+ * Tier A coverage: drives the real UsbSerialImpl orchestration against a mocked USB stack
+ * (UsbManager + the library's UsbSerialProber/UsbSerialDriver/UsbSerialPort). No hardware.
+ * Verifies permission gating, listDevices shaping, read/write semantics, the streaming
+ * exclusivity rule, enum mapping at the port boundary, control/flow lines, and detach cleanup.
+ */
+@RunWith(RobolectricTestRunner::class)
+class UsbSerialImplTest {
+    private lateinit var impl: UsbSerialImpl
+    private lateinit var usbManager: UsbManager
+    private lateinit var proberStatic: MockedStatic<UsbSerialProber>
+    private lateinit var prober: UsbSerialProber
+
+    private val events = mutableListOf<Pair<String, JSObject>>()
+    private val permissions = mutableListOf<Pair<String, Boolean>>()
+
+    @Before
+    fun setUp() {
+        val app = RuntimeEnvironment.getApplication()
+        usbManager = mock(UsbManager::class.java)
+        shadowOf(app).setSystemService(Context.USB_SERVICE, usbManager)
+
+        prober = mock(UsbSerialProber::class.java)
+        proberStatic = mockStatic(UsbSerialProber::class.java)
+        proberStatic.`when`<UsbSerialProber> { UsbSerialProber.getDefaultProber() }.thenReturn(prober)
+
+        impl =
+            UsbSerialImpl(
+                context = app,
+                emitter = { name, payload -> events.add(name to payload) },
+                resolvePermission = { id, granted -> permissions.add(id to granted) },
+            )
+    }
+
+    @After
+    fun tearDown() {
+        proberStatic.close()
+    }
+
+    // --- helpers -----------------------------------------------------------
+
+    private class Fixture(
+        val deviceId: String,
+        val device: UsbDevice,
+        val port: UsbSerialPort,
+        val connection: UsbDeviceConnection,
+    )
+
+    /** Wire a single device/driver/port and register it via listDevices(); returns handles. */
+    private fun registerDevice(hasPermission: Boolean): Fixture {
+        val device = mock(UsbDevice::class.java)
+        `when`(device.deviceId).thenReturn(7)
+        `when`(device.deviceName).thenReturn("/dev/bus/usb/001/002")
+        `when`(device.vendorId).thenReturn(0x0403)
+        `when`(device.productId).thenReturn(0x6001)
+
+        val port = mock(UsbSerialPort::class.java)
+        `when`(port.portNumber).thenReturn(0)
+
+        val driver = mock(FtdiSerialDriver::class.java)
+        `when`(driver.device).thenReturn(device)
+        `when`(driver.ports).thenReturn(listOf(port))
+        `when`(port.driver).thenReturn(driver)
+
+        val connection = mock(UsbDeviceConnection::class.java)
+
+        `when`(prober.findAllDrivers(usbManager)).thenReturn(listOf(driver))
+        `when`(prober.probeDevice(device)).thenReturn(driver)
+        `when`(usbManager.hasPermission(device)).thenReturn(hasPermission)
+        `when`(usbManager.openDevice(device)).thenReturn(connection)
+        `when`(usbManager.deviceList).thenReturn(hashMapOf("/dev/bus/usb/001/002" to device))
+
+        val devices = impl.listDevices().getJSONArray("devices")
+        val deviceId = devices.getJSONObject(0).getString("deviceId")!!
+        return Fixture(deviceId, device, port, connection)
+    }
+
+    private fun openPort(f: Fixture): String = impl.open(f.deviceId, 0).getString("portId")!!
+
+    private fun b64(bytes: ByteArray): String = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+
+    // --- discovery ---------------------------------------------------------
+
+    @Test
+    fun listDevicesShapesDescriptor() {
+        registerDevice(hasPermission = true)
+        val dev = impl.listDevices().getJSONArray("devices").getJSONObject(0)
+        assertEquals(0x0403, dev.getInt("vendorId"))
+        assertEquals(0x6001, dev.getInt("productId"))
+        assertEquals("FtdiSerialDriver", dev.getString("driverType"))
+        assertEquals(1, dev.getInt("portCount"))
+        assertTrue(dev.getBoolean("hasPermission"))
+    }
+
+    @Test
+    fun listDevicesEmptyWhenNonePresent() {
+        `when`(prober.findAllDrivers(usbManager)).thenReturn(emptyList())
+        assertEquals(0, impl.listDevices().getJSONArray("devices").length())
+    }
+
+    // --- permission gating -------------------------------------------------
+
+    @Test
+    fun openWithoutEverRequestingThrowsNeedsPermission() {
+        val f = registerDevice(hasPermission = false)
+        try {
+            impl.open(f.deviceId, 0)
+            fail("expected NEEDS_PERMISSION")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.NEEDS_PERMISSION, e.code)
+        }
+    }
+
+    @Test
+    fun openAfterDeniedThrowsPermissionDenied() {
+        val f = registerDevice(hasPermission = false)
+        impl.requestPermission(f.deviceId, "cb1") // marks requested, fires system request
+        impl.onPermissionResult(f.deviceId, false) // user denies
+        assertEquals(listOf("cb1" to false), permissions)
+        try {
+            impl.open(f.deviceId, 0)
+            fail("expected PERMISSION_DENIED")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.PERMISSION_DENIED, e.code)
+        }
+    }
+
+    @Test
+    fun requestPermissionResolvesTrueWhenAlreadyGranted() {
+        val f = registerDevice(hasPermission = true)
+        impl.requestPermission(f.deviceId, "cb2")
+        assertEquals(listOf("cb2" to true), permissions)
+    }
+
+    @Test
+    fun requestPermissionUnknownDeviceThrowsNoDevice() {
+        try {
+            impl.requestPermission("nope", "cb")
+            fail("expected NO_DEVICE")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.NO_DEVICE, e.code)
+        }
+    }
+
+    // --- open / params -----------------------------------------------------
+
+    @Test
+    fun openReturnsPortIdAndOpensPort() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        assertTrue(portId.startsWith("port_"))
+        verify(f.port).open(f.connection)
+    }
+
+    @Test
+    fun openInvalidPortNumThrowsInvalidParams() {
+        val f = registerDevice(hasPermission = true)
+        try {
+            impl.open(f.deviceId, 5)
+            fail("expected INVALID_PARAMS")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.INVALID_PARAMS, e.code)
+        }
+    }
+
+    @Test
+    fun setParametersMapsEnumsToLibraryConstants() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        impl.setParameters(portId, 115200, 8, 1.0, "none")
+        verify(f.port).setParameters(
+            115200,
+            UsbSerialPort.DATABITS_8,
+            UsbSerialPort.STOPBITS_1,
+            UsbSerialPort.PARITY_NONE,
+        )
+    }
+
+    @Test
+    fun setParametersInvalidValueRejectsBeforeHardware() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        try {
+            impl.setParameters(portId, 9600, 8, 3.0 /* bad stopbits */, "none")
+            fail("expected INVALID_PARAMS")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.INVALID_PARAMS, e.code)
+        }
+    }
+
+    // --- read / write ------------------------------------------------------
+
+    @Test
+    fun readReturnsBase64OfBytesRead() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        val payload = byteArrayOf(1, 2, 3, 4)
+        `when`(f.port.read(any(), anyInt())).thenAnswer { inv ->
+            val buf = inv.getArgument<ByteArray>(0)
+            System.arraycopy(payload, 0, buf, 0, payload.size)
+            payload.size
+        }
+        val data = impl.read(portId, 64, 500).getString("data")
+        assertArrayEquals(payload, android.util.Base64.decode(data, android.util.Base64.NO_WRAP))
+    }
+
+    @Test
+    fun readTimeoutReturnsEmptyNotError() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        `when`(f.port.read(any(), anyInt())).thenReturn(0)
+        assertEquals("", impl.read(portId, 64, 10).getString("data"))
+    }
+
+    @Test
+    fun readClosedPortThrowsPortNotOpen() {
+        try {
+            impl.read("port_999", 8, 10)
+            fail("expected PORT_NOT_OPEN")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.PORT_NOT_OPEN, e.code)
+        }
+    }
+
+    @Test
+    fun writeReturnsBytesWrittenAndCallsPort() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        val result = impl.write(portId, b64(byteArrayOf(65, 66, 67)), 250)
+        assertEquals(3, result.getInt("bytesWritten"))
+        verify(f.port).write(any(), anyInt())
+    }
+
+    @Test
+    fun writeInvalidBase64ThrowsInvalidParams() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        try {
+            impl.write(portId, "not*base64!", null)
+            fail("expected INVALID_PARAMS")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.INVALID_PARAMS, e.code)
+        }
+    }
+
+    // --- streaming exclusivity --------------------------------------------
+
+    @Test
+    fun streamStateStoppedBeforeStart() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        assertEquals("stopped", impl.getStreamState(portId).getString("state"))
+    }
+
+    @Test
+    fun oneShotReadRejectedWhileStreaming() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        // SerialInputOutputManager's constructor reads the endpoints' max packet size.
+        val endpoint = mock(android.hardware.usb.UsbEndpoint::class.java)
+        `when`(endpoint.maxPacketSize).thenReturn(64)
+        `when`(f.port.readEndpoint).thenReturn(endpoint)
+        `when`(f.port.writeEndpoint).thenReturn(endpoint)
+        `when`(f.port.read(any(), anyInt())).thenReturn(0) // stream produces nothing
+        impl.startReading(portId, 50, null, null, null, null, null)
+        try {
+            val state = impl.getStreamState(portId).getString("state")
+            assertTrue("state was $state", state == "running" || state == "starting")
+            try {
+                impl.read(portId, 8, 10)
+                fail("expected INVALID_STATE")
+            } catch (e: UsbSerialError) {
+                assertEquals(UsbSerialErrorCode.INVALID_STATE, e.code)
+            }
+        } finally {
+            impl.stopReading(portId)
+        }
+    }
+
+    @Test
+    fun getStreamConfigWithoutStreamThrowsInvalidState() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        try {
+            impl.getStreamConfig(portId)
+            fail("expected INVALID_STATE")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.INVALID_STATE, e.code)
+        }
+    }
+
+    // --- control lines / flow control -------------------------------------
+
+    @Test
+    fun getControlLinesMapsEnumSet() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        `when`(f.port.controlLines)
+            .thenReturn(EnumSet.of(UsbSerialPort.ControlLine.RTS, UsbSerialPort.ControlLine.CTS))
+        val lines = impl.getControlLines(portId)
+        assertTrue(lines.getBoolean("rts"))
+        assertTrue(lines.getBoolean("cts"))
+        assertFalse(lines.getBoolean("dtr"))
+        assertFalse(lines.getBoolean("ri"))
+    }
+
+    @Test
+    fun setDtrDelegatesToPort() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        impl.setDTR(portId, true)
+        verify(f.port).dtr = true
+    }
+
+    @Test
+    fun getFlowControlMapsToString() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        `when`(f.port.flowControl).thenReturn(UsbSerialPort.FlowControl.RTS_CTS)
+        assertEquals("rts_cts", impl.getFlowControl(portId).getString("mode"))
+    }
+
+    // --- detach cleanup ----------------------------------------------------
+
+    @Test
+    fun detachEmitsEventAndReapsPort() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+
+        impl.onDeviceDetached(f.device)
+
+        assertTrue("expected a detached event", events.any { it.first == "detached" })
+        try {
+            impl.read(portId, 8, 10)
+            fail("expected PORT_NOT_OPEN after detach")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.PORT_NOT_OPEN, e.code)
+        }
+    }
+
+    @Test
+    fun disconnectDuringReadThrowsDeviceDisconnected() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        // Device no longer present in the system list -> classified as disconnect.
+        `when`(usbManager.deviceList).thenReturn(hashMapOf())
+        `when`(f.port.read(any(), anyInt())).thenThrow(IOException("gone"))
+        try {
+            impl.read(portId, 8, 50)
+            fail("expected DEVICE_DISCONNECTED")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.DEVICE_DISCONNECTED, e.code)
+        }
+    }
+}

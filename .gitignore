@@ -1,0 +1,17 @@
+# Node
+node_modules/
+dist/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/captures/
+android/local.properties
+.gradle/
+
+# Logs / OS
+*.log
+.DS_Store
+
+# Spec-driven dev tooling (kept local)
+.claude/
