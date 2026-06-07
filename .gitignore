@@ -9,9 +9,42 @@ android/captures/
 android/local.properties
 .gradle/
 
+# Node / TS
+coverage/
+*.tsbuildinfo
+.npmrc
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDE / editor
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# Android native build / Android Studio
+android/.cxx/
+android/.externalNativeBuild/
+android/captures/
+*.hprof
+
+# Android signing & secrets — never commit these
+*.keystore
+*.jks
+keystore.properties
+key.properties
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
 # Logs / OS
 *.log
 .DS_Store
+Thumbs.db
 
 # Spec-driven dev tooling (kept local)
 .claude/
