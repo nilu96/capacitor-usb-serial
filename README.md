@@ -12,7 +12,7 @@ Android device over USB‑C / OTG — no root required.
 ## Install
 
 ```bash
-npm install capacitor-usb-serial
+npm install @leeskies/capacitor-usb-serial
 npx cap sync
 ```
 
@@ -47,7 +47,7 @@ USB permission must be granted **before** a port can be opened:
 Copy‑paste into any Capacitor app to confirm the plugin works end‑to‑end:
 
 ```ts
-import { UsbSerial } from 'capacitor-usb-serial';
+import { UsbSerial } from '@leeskies/capacitor-usb-serial';
 
 async function demo() {
   const { devices } = await UsbSerial.listDevices();

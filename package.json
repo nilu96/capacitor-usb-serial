@@ -1,6 +1,9 @@
 {
-  "name": "capacitor-usb-serial",
+  "name": "@leeskies/capacitor-usb-serial",
   "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Capacitor v7 plugin exposing the full functionality of mik3y/usb-serial-for-android (USB serial communication on Android).",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

@@ -37,7 +37,7 @@ Covered:
 - a **CH340** USB‑serial adapter (loopback TX↔RX, or wired to a device that echoes), and/or
 - a **CDC/ACM** board (e.g. Arduino Uno) running a sketch that echoes bytes back.
 
-Build a minimal app that imports `capacitor-usb-serial`, or use the verification snippet
+Build a minimal app that imports `@leeskies/capacitor-usb-serial`, or use the verification snippet
 in the README. Record PASS/FAIL for each step.
 
 ### 1. Discovery
