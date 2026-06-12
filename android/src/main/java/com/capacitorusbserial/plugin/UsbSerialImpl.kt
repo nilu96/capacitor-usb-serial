@@ -139,8 +139,17 @@ class UsbSerialImpl(
         }
         store.markPermissionRequested(deviceId)
         pendingPermission[deviceId] = callbackId
-        val intent = Intent(ACTION_USB_PERMISSION).apply { putExtra(EXTRA_DEVICE_ID, deviceId) }
-        val flags = PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        // Explicit intent (scoped to our own package) + FLAG_IMMUTABLE. On Android 14
+        // (API 34+) the system rejects a PendingIntent that is both FLAG_MUTABLE and wraps
+        // an implicit intent, so requestPermission() silently never shows the dialog. The
+        // UsbManager still delivers its result extras to an immutable intent, so immutability
+        // costs us nothing here. See https://developer.android.com/reference/android/app/PendingIntent
+        val intent =
+            Intent(ACTION_USB_PERMISSION).apply {
+                setPackage(context.packageName)
+                putExtra(EXTRA_DEVICE_ID, deviceId)
+            }
+        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         val pi = PendingIntent.getBroadcast(context, deviceId.hashCode(), intent, flags)
         usbManager.requestPermission(device, pi)
     }
