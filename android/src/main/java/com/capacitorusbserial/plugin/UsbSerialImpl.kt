@@ -28,14 +28,17 @@ import java.util.concurrent.RejectedExecutionException
 class UsbSerialImpl(
     private val context: Context,
     private val emitter: (eventName: String, payload: JSObject) -> Unit,
-    private val resolvePermission: (callbackId: String, granted: Boolean) -> Unit,
+    private val resolvePermission: (callbackId: String, granted: Boolean, coalesced: Boolean) -> Unit,
+    private val rejectPermission: (callbackId: String, code: UsbSerialErrorCode, message: String) -> Unit,
 ) {
     companion object {
         const val ACTION_USB_PERMISSION = "com.capacitorusbserial.plugin.USB_PERMISSION"
         const val EXTRA_DEVICE_ID = "com.capacitorusbserial.plugin.DEVICE_ID"
         private const val DEFAULT_READ_BUFFER = 16 * 1024
+        private const val MAX_READ_BUFFER = 1 shl 20
         private const val DEFAULT_READ_TIMEOUT = 1000
         private const val DEFAULT_WRITE_TIMEOUT = 1000
+        private const val TAG = "UsbSerial"
     }
 
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -46,8 +49,11 @@ class UsbSerialImpl(
     private val customTable = ProbeTable()
     private var hasCustomMappings = false
 
-    // deviceId -> callbackId awaiting a permission broadcast (Task 21).
-    private val pendingPermission = ConcurrentHashMap<String, String>()
+    // deviceId -> callbackIds awaiting a permission broadcast. Multiple requests for the
+    // same device coalesce onto one system dialog; the atomic remove() on settle is what
+    // guarantees each callback resolves/rejects exactly once under any interleaving of
+    // broadcast, detach, and teardown.
+    private val pendingPermission = ConcurrentHashMap<String, MutableList<String>>()
 
     // Buffered cold-start attach payload, replayed to the first 'attached' listener (Req 12.5).
     @Volatile private var bufferedAttach: JSObject? = null
@@ -69,7 +75,7 @@ class UsbSerialImpl(
             info.put("vendorId", device.vendorId)
             info.put("productId", device.productId)
             info.put("deviceName", device.deviceName)
-            info.put("serialNumber", safeSerial(device, driver))
+            info.put("serialNumber", safeSerial(deviceId, device))
             info.put("driverType", EnumMaps.driverTypeName(driver))
             info.put("portCount", driver.ports.size)
             info.put("hasPermission", usbManager.hasPermission(device))
@@ -80,21 +86,25 @@ class UsbSerialImpl(
 
     /** getSerial() requires permission and an open-ish handle on some drivers; null-safe. */
     private fun safeSerial(
+        deviceId: String,
         device: android.hardware.usb.UsbDevice,
-        @Suppress("UNUSED_PARAMETER") driver: UsbSerialDriver,
-    ): String? =
-        if (!usbManager.hasPermission(device)) {
-            null
-        } else {
-            runCatching {
-                val conn = usbManager.openDevice(device) ?: return null
-                try {
-                    conn.serial
-                } finally {
-                    conn.close()
-                }
-            }.getOrNull()
+    ): String? {
+        if (!usbManager.hasPermission(device)) return null
+        // A second concurrent UsbDeviceConnection can disturb active I/O on some
+        // drivers; reuse the open port's connection when one exists.
+        val openHandle = store.portsForDevice(deviceId).firstOrNull()
+        if (openHandle != null) {
+            return runCatching { openHandle.connection.serial }.getOrNull()
         }
+        return runCatching {
+            val conn = usbManager.openDevice(device) ?: return null
+            try {
+                conn.serial
+            } finally {
+                conn.close()
+            }
+        }.getOrNull()
+    }
 
     // ----------------------------------------------------------------------
     // Task 20 — Custom prober registration
@@ -130,15 +140,30 @@ class UsbSerialImpl(
         return JSObject().put("granted", usbManager.hasPermission(device))
     }
 
-    /** Issues the system permission prompt; resolution arrives via [onPermissionResult]. */
+    /**
+     * Issues the system permission prompt; resolution arrives via [onPermissionResult].
+     * Concurrent requests for the same device coalesce onto the single pending dialog;
+     * only the first caller triggers it, and all callers settle together.
+     */
     fun requestPermission(deviceId: String, callbackId: String) {
         val device = store.getDevice(deviceId)
         if (usbManager.hasPermission(device)) {
-            resolvePermission(callbackId, true)
+            resolvePermission(callbackId, true, false)
             return
         }
         store.markPermissionRequested(deviceId)
-        pendingPermission[deviceId] = callbackId
+        // The first-request decision must happen inside compute (under the bin lock);
+        // checking the returned list's size would race a concurrent append and could
+        // leave no caller issuing the dialog.
+        var first = false
+        pendingPermission.compute(deviceId) { _, v ->
+            if (v == null) first = true
+            (v ?: mutableListOf()).also { it += callbackId }
+        }
+        if (!first) {
+            android.util.Log.w(TAG, "requestPermission($deviceId): coalescing onto pending request")
+            return
+        }
         // Explicit intent (scoped to our own package) + FLAG_IMMUTABLE. On Android 14
         // (API 34+) the system rejects a PendingIntent that is both FLAG_MUTABLE and wraps
         // an implicit intent, so requestPermission() silently never shows the dialog. The
@@ -156,8 +181,16 @@ class UsbSerialImpl(
 
     /** Called by the broadcast receiver when a permission result arrives. */
     fun onPermissionResult(deviceId: String, granted: Boolean) {
-        val callbackId = pendingPermission.remove(deviceId) ?: return
-        resolvePermission(callbackId, granted)
+        val callbackIds = pendingPermission.remove(deviceId) ?: return
+        callbackIds.forEachIndexed { i, callbackId ->
+            resolvePermission(callbackId, granted, i > 0)
+        }
+    }
+
+    /** Reject every pending permission request for [deviceId] (detach/teardown paths). */
+    private fun failPendingPermissions(deviceId: String, message: String) {
+        val callbackIds = pendingPermission.remove(deviceId) ?: return
+        callbackIds.forEach { rejectPermission(it, UsbSerialErrorCode.NO_DEVICE, message) }
     }
 
     // ----------------------------------------------------------------------
@@ -241,8 +274,15 @@ class UsbSerialImpl(
     // ----------------------------------------------------------------------
 
     fun read(portId: String, length: Int?, timeout: Int?): JSObject {
+        if (length != null && length !in 1..MAX_READ_BUFFER) {
+            throw UsbSerialError(
+                UsbSerialErrorCode.INVALID_PARAMS,
+                "length must be between 1 and $MAX_READ_BUFFER, got $length",
+            )
+        }
         val handle = store.getPort(portId)
-        if (handle.stream != null) {
+        // Only a RUNNING stream owns the read endpoint; a dead one no longer blocks.
+        if (handle.stream.get()?.isRunning() == true) {
             throw UsbSerialError(
                 UsbSerialErrorCode.INVALID_STATE,
                 "Cannot one-shot read while a stream is active on port $portId",
@@ -258,9 +298,11 @@ class UsbSerialImpl(
     fun write(portId: String, data: String, timeout: Int?): JSObject {
         val handle = store.getPort(portId)
         val bytes = Base64Util.decode(data)
-        val stream = handle.stream
-        if (stream != null) {
+        val stream = handle.stream.get()
+        if (stream != null && stream.isRunning()) {
             // Route through the manager's async write path while it owns the port.
+            // A dead manager's queue is never drained (library does no state check in
+            // writeAsync), so anything not RUNNING falls through to the direct write.
             stream.writeAsync(bytes)
         } else {
             onPortIo(handle) { handle.port.write(bytes, timeout ?: DEFAULT_WRITE_TIMEOUT) }
@@ -271,11 +313,11 @@ class UsbSerialImpl(
     fun writeAsync(portId: String, data: String) {
         val handle = store.getPort(portId)
         val bytes = Base64Util.decode(data)
-        val stream = handle.stream
-        if (stream != null) {
+        val stream = handle.stream.get()
+        if (stream != null && stream.isRunning()) {
             stream.writeAsync(bytes)
         } else {
-            // No stream: fire-and-forget on the per-port executor so we resolve immediately.
+            // No live stream: fire-and-forget on the per-port executor so we resolve immediately.
             runCatching {
                 handle.executor.submit { runCatching { handle.port.write(bytes, DEFAULT_WRITE_TIMEOUT) } }
             }
@@ -296,17 +338,20 @@ class UsbSerialImpl(
         threadPriority: Int?,
     ) {
         val handle = store.getPort(portId)
-        if (handle.stream?.isRunning() == true) {
+        if (handle.stream.get()?.isRunning() == true) {
             throw UsbSerialError(UsbSerialErrorCode.INVALID_STATE, "Stream already running on port $portId")
         }
-        val manager =
+        lateinit var manager: SerialStreamManager
+        manager =
             SerialStreamManager(
                 portId = portId,
                 port = handle.port,
                 onData = { bytes ->
                     emitter("data", JSObject().put("portId", portId).put("data", Base64Util.encode(bytes)))
                 },
-                onError = { e -> onStreamError(handle, e) },
+                // Capture the manager so the error path can identity-guard its clear: a
+                // late onRunError from this (dying) manager must not clobber a newer one.
+                onError = { e -> onStreamError(handle, manager, e) },
             )
         manager.applyTuning(
             readTimeout,
@@ -317,25 +362,25 @@ class UsbSerialImpl(
             threadPriority,
         )
         manager.start()
-        handle.stream = manager
+        handle.stream.set(manager)
     }
 
     fun stopReading(portId: String) {
         val handle = store.getPort(portId)
-        handle.stream?.stop()
-        handle.stream = null
+        handle.stream.get()?.stop()
+        handle.stream.set(null)
     }
 
     fun getStreamState(portId: String): JSObject {
         val handle = store.getPort(portId)
-        val state = handle.stream?.state() ?: "stopped"
+        val state = handle.stream.get()?.state() ?: "stopped"
         return JSObject().put("state", state)
     }
 
     fun getStreamConfig(portId: String): JSObject {
         val handle = store.getPort(portId)
         val stream =
-            handle.stream
+            handle.stream.get()
                 ?: throw UsbSerialError(UsbSerialErrorCode.INVALID_STATE, "No active stream on port $portId")
         val cfg = stream.configSnapshot()
         return JSObject()
@@ -346,13 +391,17 @@ class UsbSerialImpl(
             .put("readQueueBufferCount", cfg.readQueueBufferCount)
     }
 
-    private fun onStreamError(handle: PortHandle, e: Exception) {
+    private fun onStreamError(handle: PortHandle, dying: SerialStreamManager, e: Exception) {
         emitter("error", JSObject().put("portId", handle.portId).put("message", e.message ?: "stream error"))
-        // If the device is gone, perform detach cleanup and notify.
         if (isDisconnect(handle, e)) {
+            // Device is gone: perform detach cleanup and notify.
             val deviceId = handle.deviceId
             store.reapDevice(deviceId)
             emitter("detached", JSObject().put("deviceId", deviceId))
+        } else {
+            // Port stays usable: detach the dead manager so one-shot I/O resumes.
+            // compareAndSet only — a new stream may already have replaced it.
+            handle.stream.compareAndSet(dying, null)
         }
     }
 
@@ -491,6 +540,7 @@ class UsbSerialImpl(
         if (store.hasDevice(deviceId) || store.portsForDevice(deviceId).isNotEmpty()) {
             store.reapDevice(deviceId)
         }
+        failPendingPermissions(deviceId, "Device detached while permission request pending")
         emitter("detached", JSObject().put("deviceId", deviceId))
     }
 
@@ -503,10 +553,16 @@ class UsbSerialImpl(
 
     fun teardown() {
         store.reapAll()
+        pendingPermission.keys.toList().forEach {
+            failPendingPermissions(it, "Plugin destroyed while permission request pending")
+        }
         pendingPermission.clear()
     }
 
     val permissionAction: String get() = ACTION_USB_PERMISSION
+
+    /** Test seam: the store is private and nothing else exposes a [PortHandle]. */
+    internal fun portHandleForTest(portId: String): PortHandle = store.getPort(portId)
 
     // ----------------------------------------------------------------------
     // Per-port execution helpers
@@ -541,9 +597,15 @@ class UsbSerialImpl(
 
     private fun isDisconnect(handle: PortHandle, e: Throwable): Boolean {
         if (e is UsbSerialError) return e.code == UsbSerialErrorCode.DEVICE_DISCONNECTED
-        val device = runCatching { handle.connection }.getOrNull()
-        // Device considered gone if it is no longer present in the system device list.
-        val present = usbManager.deviceList.values.any { it.deviceName == handle.port.device.deviceName }
-        return !present || device == null || !handle.port.isOpen
+        // Present only if the same device still occupies its path: the OS reuses
+        // /dev/bus/usb/... names, so a bare deviceName match could be a different
+        // device freshly attached to the reused slot.
+        val dev = handle.port.device
+        val current = usbManager.deviceList[dev.deviceName]
+        val present =
+            current != null &&
+                current.vendorId == dev.vendorId &&
+                current.productId == dev.productId
+        return !present || !handle.port.isOpen
     }
 }

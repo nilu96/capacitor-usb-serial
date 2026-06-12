@@ -39,6 +39,12 @@ Native serial objects can't cross the Capacitor bridge, so the plugin is **handl
 USB permission must be granted **before** a port can be opened:
 
 - `requestPermission({ deviceId })` shows the system dialog and resolves `{ granted }`.
+- Concurrent `requestPermission` calls for the same device **coalesce** onto one dialog;
+  every pending call settles with the same result, and the coalesced ones resolve with
+  `coalesced: true`.
+- If the device detaches while the dialog is pending, the promise **rejects** with
+  `NO_DEVICE` (distinguishable from the user declining, which resolves
+  `{ granted: false }`).
 - `open()` rejects with `NEEDS_PERMISSION` if you never asked, or `PERMISSION_DENIED`
   if the user declined.
 
@@ -116,6 +122,15 @@ Lifecycle: `open`, `close`, `isOpen`, `getPortInfo`.
 Config: `setParameters`.
 I/O: `read`, `write`, `writeAsync`.
 Streaming: `startReading`, `stopReading`, `getStreamState`, `getStreamConfig`, `data`/`error` events.
+
+**Write semantics during streaming:** while a stream is running, `write()` enqueues onto
+the stream's async write queue — `bytesWritten` confirms *acceptance*, not transmission.
+With no running stream, `write()` is synchronous and confirms delivery to the driver.
+
+**Stream errors:** if a stream dies from a run error you get an `error` event and the
+port self-heals — one-shot `read()`/`write()` work again immediately, and
+`getStreamState()` reports `stopped`. Call `startReading()` again to resume streaming.
+If the error was a disconnect you also get `detached`, and the port is reaped.
 Control lines: `getControlLines`, `getSupportedControlLines`, `getCD/CTS/DSR/DTR/RI/RTS`, `setDTR`, `setRTS`.
 Flow control: `setFlowControl`, `getFlowControl`, `getSupportedFlowControl`, `getXON` (+ `CHAR_XON`/`CHAR_XOFF`).
 Maintenance: `purgeHwBuffers`, `setBreak`, `setReadQueue`, `getReadQueueConfig`.

@@ -6,11 +6,14 @@ import com.hoho.android.usbserial.driver.UsbSerialPort
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * One open serial port plus everything that must be reaped with it: the native
  * connection, the per-port single-threaded executor that serializes its I/O, and the
- * optional active stream manager.
+ * optional active stream manager. [stream] is an AtomicReference because it is written
+ * from both the bridge dispatch pool (start/stopReading) and the stream's own error
+ * thread (identity-guarded clear on run error).
  */
 class PortHandle(
     val portId: String,
@@ -18,7 +21,7 @@ class PortHandle(
     val port: UsbSerialPort,
     val connection: UsbDeviceConnection,
     val executor: ExecutorService,
-    var stream: SerialStreamManager? = null,
+    val stream: AtomicReference<SerialStreamManager?> = AtomicReference(null),
 )
 
 /**
@@ -106,7 +109,7 @@ class HandleStore {
     fun portsForDevice(deviceId: String): List<PortHandle> = ports.values.filter { it.deviceId == deviceId }
 
     private fun closeHandle(handle: PortHandle) {
-        runCatching { handle.stream?.stop() }
+        runCatching { handle.stream.get()?.stop() }
         runCatching { handle.port.close() }
         runCatching { handle.connection.close() }
         runCatching { handle.executor.shutdownNow() }

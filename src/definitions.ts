@@ -76,6 +76,15 @@ export interface PermissionResult {
   granted: boolean;
 }
 
+export interface RequestPermissionResult extends PermissionResult {
+  /**
+   * Present (true) when this call was coalesced onto a permission request already
+   * pending for the same device: only one system dialog is shown, and every pending
+   * call settles with the same result. Absent on the first (dialog-triggering) call.
+   */
+  coalesced?: boolean;
+}
+
 export interface OpenOptions {
   deviceId: string;
   /** Defaults to 0. */
@@ -111,7 +120,7 @@ export interface SerialParameters {
 
 export interface ReadOptions {
   portId: string;
-  /** Max bytes to read; defaults to an internal buffer size. */
+  /** Max bytes to read, 1..1048576 (1 MiB); defaults to an internal buffer size. */
   length?: number;
   /** Milliseconds; defaults to an internal value. A timeout yields an empty result. */
   timeout?: number;
@@ -246,7 +255,13 @@ export interface UsbSerialPlugin extends Plugin {
   registerDriver(options: RegisterDriverOptions): Promise<void>;
 
   // Permission
-  requestPermission(options: DeviceRef): Promise<PermissionResult>;
+  /**
+   * Shows the system USB permission dialog and resolves with the user's choice.
+   * Concurrent calls for the same device coalesce onto one dialog; coalesced calls
+   * resolve with `coalesced: true`. Rejects with `NO_DEVICE` if the device detaches
+   * (or the plugin is destroyed) while the request is pending.
+   */
+  requestPermission(options: DeviceRef): Promise<RequestPermissionResult>;
   hasPermission(options: DeviceRef): Promise<PermissionResult>;
 
   // Port lifecycle
@@ -260,7 +275,17 @@ export interface UsbSerialPlugin extends Plugin {
 
   // I/O
   read(options: ReadOptions): Promise<ReadResult>;
+  /**
+   * While a stream is RUNNING on the port, the bytes are enqueued onto the stream's
+   * async write queue and `bytesWritten` confirms acceptance, not transmission. With
+   * no running stream the write is synchronous and `bytesWritten` reflects delivery
+   * to the driver.
+   */
   write(options: WriteOptions): Promise<WriteResult>;
+  /**
+   * Fire-and-forget write: resolves on acceptance, never confirms transmission.
+   * Uses the stream's queue while one is RUNNING, the port executor otherwise.
+   */
   writeAsync(options: WriteAsyncOptions): Promise<void>;
 
   // Streaming

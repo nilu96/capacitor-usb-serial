@@ -7,6 +7,7 @@ import type {
   RegisterDriverOptions,
   DeviceRef,
   PermissionResult,
+  RequestPermissionResult,
   OpenOptions,
   OpenResult,
   PortRef,
@@ -60,7 +61,7 @@ export class WebUsbSerial extends WebPlugin implements UsbSerialPlugin {
   registerDriver(_options: RegisterDriverOptions): Promise<void> {
     return unsupported();
   }
-  requestPermission(_options: DeviceRef): Promise<PermissionResult> {
+  requestPermission(_options: DeviceRef): Promise<RequestPermissionResult> {
     return unsupported();
   }
   hasPermission(_options: DeviceRef): Promise<PermissionResult> {
