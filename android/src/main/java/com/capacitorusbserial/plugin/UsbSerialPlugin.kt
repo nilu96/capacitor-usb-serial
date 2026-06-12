@@ -32,9 +32,37 @@ class UsbSerialPlugin : Plugin() {
             UsbSerialImpl(
                 context = context.applicationContext,
                 emitter = { name, payload -> notifyListeners(name, payload) },
-                resolvePermission = { callbackId, granted -> resolvePermission(callbackId, granted) },
+                resolvePermission = { callbackId, granted, coalesced ->
+                    resolvePermission(callbackId, granted, coalesced)
+                },
+                rejectPermission = { callbackId, code, message ->
+                    rejectPermission(callbackId, code, message)
+                },
             )
         registerReceiver()
+        consumeLaunchAttachIntent()
+    }
+
+    /**
+     * Cold-start half of the auto-attach flow: when the app was launched by a
+     * USB_DEVICE_ATTACHED intent, buffer the attach for replay to the first 'attached'
+     * listener. Warm attaches are NOT handled here — the runtime receiver gets the
+     * system broadcast, so inspecting onNewIntent too would double-emit.
+     */
+    private fun consumeLaunchAttachIntent() {
+        val intent = activity?.intent ?: return
+        if (intent.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        val device = UsbIntents.usbDevice(intent) ?: return
+        // removeExtra only mutates the process-local copy; after process death the
+        // original intent is re-delivered from recents, so also verify the device is
+        // still attached before replaying a potentially stale attach.
+        intent.removeExtra(UsbManager.EXTRA_DEVICE)
+        val usbManager = context.getSystemService(android.content.Context.USB_SERVICE) as UsbManager
+        val current = usbManager.deviceList[device.deviceName]
+        if (current == null || current.vendorId != device.vendorId || current.productId != device.productId) {
+            return
+        }
+        impl.handleAttached(current, coldStart = true)
     }
 
     override fun handleOnDestroy() {
@@ -62,9 +90,18 @@ class UsbSerialPlugin : Plugin() {
         receiver = r
     }
 
-    private fun resolvePermission(callbackId: String, granted: Boolean) {
+    private fun resolvePermission(callbackId: String, granted: Boolean, coalesced: Boolean) {
         val saved = bridge.getSavedCall(callbackId) ?: return
-        saved.resolve(JSObject().put("granted", granted))
+        val result = JSObject().put("granted", granted)
+        // Only coalesced results carry the marker; the first caller's shape is unchanged.
+        if (coalesced) result.put("coalesced", true)
+        saved.resolve(result)
+        bridge.releaseCall(saved)
+    }
+
+    private fun rejectPermission(callbackId: String, code: UsbSerialErrorCode, message: String) {
+        val saved = bridge.getSavedCall(callbackId) ?: return
+        saved.reject(message, code.name)
         bridge.releaseCall(saved)
     }
 
@@ -264,7 +301,11 @@ class UsbSerialPlugin : Plugin() {
     @PluginMethod(returnType = PluginMethod.RETURN_NONE)
     override fun addListener(call: PluginCall) {
         super.addListener(call)
-        if (this::impl.isInitialized) impl.flushBufferedAttach()
+        // Replay the buffered cold-start attach only to an 'attached' listener — flushing
+        // on any registration would emit to zero listeners and lose the payload.
+        if (this::impl.isInitialized && call.getString("eventName") == "attached") {
+            impl.flushBufferedAttach()
+        }
     }
 
     // ----------------------------------------------------------------------

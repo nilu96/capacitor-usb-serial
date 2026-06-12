@@ -44,7 +44,8 @@ class UsbSerialImplTest {
     private lateinit var prober: UsbSerialProber
 
     private val events = mutableListOf<Pair<String, JSObject>>()
-    private val permissions = mutableListOf<Pair<String, Boolean>>()
+    private val permissions = mutableListOf<Triple<String, Boolean, Boolean>>()
+    private val rejections = mutableListOf<Pair<String, UsbSerialErrorCode>>()
 
     @Before
     fun setUp() {
@@ -60,7 +61,8 @@ class UsbSerialImplTest {
             UsbSerialImpl(
                 context = app,
                 emitter = { name, payload -> events.add(name to payload) },
-                resolvePermission = { id, granted -> permissions.add(id to granted) },
+                resolvePermission = { id, granted, coalesced -> permissions.add(Triple(id, granted, coalesced)) },
+                rejectPermission = { id, code, _ -> rejections.add(id to code) },
             )
     }
 
@@ -88,6 +90,7 @@ class UsbSerialImplTest {
 
         val port = mock(UsbSerialPort::class.java)
         `when`(port.portNumber).thenReturn(0)
+        `when`(port.device).thenReturn(device)
 
         val driver = mock(FtdiSerialDriver::class.java)
         `when`(driver.device).thenReturn(device)
@@ -148,7 +151,7 @@ class UsbSerialImplTest {
         val f = registerDevice(hasPermission = false)
         impl.requestPermission(f.deviceId, "cb1") // marks requested, fires system request
         impl.onPermissionResult(f.deviceId, false) // user denies
-        assertEquals(listOf("cb1" to false), permissions)
+        assertEquals(listOf(Triple("cb1", false, false)), permissions)
         try {
             impl.open(f.deviceId, 0)
             fail("expected PERMISSION_DENIED")
@@ -161,7 +164,7 @@ class UsbSerialImplTest {
     fun requestPermissionResolvesTrueWhenAlreadyGranted() {
         val f = registerDevice(hasPermission = true)
         impl.requestPermission(f.deviceId, "cb2")
-        assertEquals(listOf("cb2" to true), permissions)
+        assertEquals(listOf(Triple("cb2", true, false)), permissions)
     }
 
     @Test
@@ -383,5 +386,165 @@ class UsbSerialImplTest {
         } catch (e: UsbSerialError) {
             assertEquals(UsbSerialErrorCode.DEVICE_DISCONNECTED, e.code)
         }
+    }
+
+    // --- dead-stream gates (a stopped manager must not block or swallow I/O) ---
+
+    /** Inject a never-started manager (state STOPPED => isRunning() false) into the handle. */
+    private fun injectDeadStream(f: Fixture, portId: String): SerialStreamManager {
+        val endpoint = mock(android.hardware.usb.UsbEndpoint::class.java)
+        `when`(endpoint.maxPacketSize).thenReturn(64)
+        `when`(f.port.readEndpoint).thenReturn(endpoint)
+        `when`(f.port.writeEndpoint).thenReturn(endpoint)
+        val manager = SerialStreamManager(portId, f.port, {}, {})
+        impl.portHandleForTest(portId).stream.set(manager)
+        return manager
+    }
+
+    @Test
+    fun writeWithDeadStreamFallsThroughToDirectWrite() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        injectDeadStream(f, portId)
+        val result = impl.write(portId, b64("hi".toByteArray()), null)
+        assertEquals(2, result.getInt("bytesWritten"))
+        verify(f.port).write(any(), anyInt())
+    }
+
+    @Test
+    fun readWithDeadStreamPerformsOneShotRead() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        injectDeadStream(f, portId)
+        `when`(f.port.read(any(), anyInt())).thenReturn(0)
+        assertEquals("", impl.read(portId, 8, 10).getString("data"))
+    }
+
+    @Test
+    fun writeAsyncWithDeadStreamUsesPortExecutor() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        injectDeadStream(f, portId)
+        impl.writeAsync(portId, b64("hi".toByteArray()))
+        impl.portHandleForTest(portId).executor.submit {}.get() // drain the executor
+        verify(f.port).write(any(), anyInt())
+    }
+
+    // --- permission coalescing / exactly-once settling ----------------------
+
+    @Test
+    fun secondRequestCoalescesOntoPendingDialog() {
+        val f = registerDevice(hasPermission = false)
+        impl.requestPermission(f.deviceId, "cb1")
+        impl.requestPermission(f.deviceId, "cb2")
+        verify(usbManager, org.mockito.Mockito.times(1))
+            .requestPermission(any(UsbDevice::class.java), any(android.app.PendingIntent::class.java))
+        impl.onPermissionResult(f.deviceId, true)
+        assertEquals(
+            listOf(Triple("cb1", true, false), Triple("cb2", true, true)),
+            permissions,
+        )
+    }
+
+    @Test
+    fun detachRejectsPendingPermissionsExactlyOnce() {
+        val f = registerDevice(hasPermission = false)
+        impl.requestPermission(f.deviceId, "cb1")
+        impl.requestPermission(f.deviceId, "cb2")
+        impl.onDeviceDetached(f.device)
+        assertEquals(
+            listOf("cb1" to UsbSerialErrorCode.NO_DEVICE, "cb2" to UsbSerialErrorCode.NO_DEVICE),
+            rejections,
+        )
+        // A late broadcast after the detach settle must be a no-op (no double settle).
+        impl.onPermissionResult(f.deviceId, true)
+        assertTrue(permissions.isEmpty())
+        assertEquals(2, rejections.size)
+    }
+
+    @Test
+    fun teardownRejectsPendingPermissions() {
+        val f = registerDevice(hasPermission = false)
+        impl.requestPermission(f.deviceId, "cb1")
+        impl.teardown()
+        assertEquals(listOf("cb1" to UsbSerialErrorCode.NO_DEVICE), rejections)
+    }
+
+    // --- cold-start attach buffering ----------------------------------------
+
+    @Test
+    fun coldStartAttachBuffersAndFlushesExactlyOnce() {
+        val f = registerDevice(hasPermission = true)
+        events.clear()
+        impl.handleAttached(f.device, coldStart = true)
+        assertEquals(1, events.count { it.first == "attached" }) // immediate emit
+        impl.flushBufferedAttach()
+        assertEquals(2, events.count { it.first == "attached" }) // replay to first listener
+        impl.flushBufferedAttach()
+        assertEquals(2, events.count { it.first == "attached" }) // second flush is a no-op
+    }
+
+    // --- isDisconnect identity check -----------------------------------------
+
+    @Test
+    fun reusedDevicePathWithDifferentDeviceClassifiesAsDisconnect() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        // Same /dev path now occupied by a different device (VID mismatch).
+        val imposter = mock(UsbDevice::class.java)
+        `when`(imposter.deviceName).thenReturn("/dev/bus/usb/001/002")
+        `when`(imposter.vendorId).thenReturn(0x1234)
+        `when`(imposter.productId).thenReturn(0x6001)
+        `when`(usbManager.deviceList).thenReturn(hashMapOf("/dev/bus/usb/001/002" to imposter))
+        `when`(f.port.read(any(), anyInt())).thenThrow(IOException("gone"))
+        try {
+            impl.read(portId, 8, 50)
+            fail("expected DEVICE_DISCONNECTED")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.DEVICE_DISCONNECTED, e.code)
+        }
+    }
+
+    @Test
+    fun presentDeviceWithOpenPortClassifiesAsIoError() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        `when`(f.port.isOpen).thenReturn(true) // Mockito default false would read as disconnect
+        `when`(f.port.read(any(), anyInt())).thenThrow(IOException("transient"))
+        try {
+            impl.read(portId, 8, 50)
+            fail("expected IO_ERROR")
+        } catch (e: UsbSerialError) {
+            assertEquals(UsbSerialErrorCode.IO_ERROR, e.code)
+        }
+    }
+
+    // --- read() length validation --------------------------------------------
+
+    @Test
+    fun readRejectsBadLengths() {
+        val f = registerDevice(hasPermission = true)
+        val portId = openPort(f)
+        for (bad in listOf(0, -1, (1 shl 20) + 1)) {
+            try {
+                impl.read(portId, bad, 10)
+                fail("expected INVALID_PARAMS for length $bad")
+            } catch (e: UsbSerialError) {
+                assertEquals(UsbSerialErrorCode.INVALID_PARAMS, e.code)
+            }
+        }
+        verify(f.port, org.mockito.Mockito.never()).read(any(), anyInt())
+    }
+
+    // --- safeSerial reuses the open connection --------------------------------
+
+    @Test
+    fun listDevicesWithOpenPortDoesNotOpenSecondConnection() {
+        val f = registerDevice(hasPermission = true) // listDevices in helper: 1st openDevice
+        `when`(f.connection.serial).thenReturn("SN123")
+        openPort(f) // 2nd openDevice (the real open)
+        val dev = impl.listDevices().getJSONArray("devices").getJSONObject(0)
+        assertEquals("SN123", dev.getString("serialNumber"))
+        verify(usbManager, org.mockito.Mockito.times(2)).openDevice(f.device)
     }
 }

@@ -3,7 +3,6 @@ package com.capacitorusbserial.plugin
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 
 /**
@@ -23,21 +22,13 @@ class UsbEventReceiver(private val impl: UsbSerialImpl) : BroadcastReceiver() {
                 impl.onPermissionResult(deviceId, granted)
             }
             UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                val device = device(intent) ?: return
+                val device = UsbIntents.usbDevice(intent) ?: return
                 impl.handleAttached(device, coldStart = false)
             }
             UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                val device = device(intent) ?: return
+                val device = UsbIntents.usbDevice(intent) ?: return
                 impl.onDeviceDetached(device)
             }
         }
     }
-
-    @Suppress("DEPRECATION")
-    private fun device(intent: Intent): UsbDevice? =
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-        } else {
-            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-        }
 }
