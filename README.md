@@ -144,11 +144,6 @@ Every rejection carries a stable `code`: `NO_DEVICE`, `NEEDS_PERMISSION`,
 `PERMISSION_DENIED`, `PORT_NOT_OPEN`, `INVALID_PARAMS`, `INVALID_STATE`, `IO_ERROR`,
 `DEVICE_DISCONNECTED`, `UNSUPPORTED_OPERATION`, `UNSUPPORTED_PLATFORM`.
 
-## Help & contact
-
-Maintained by Lee Skies. Available for integration help and custom Capacitor /
-USB-serial work — [lee2dskies@gmail.com](mailto:lee2dskies@gmail.com).
-
 ## Credits
 
 This plugin is a thin bridge — the genuinely hard part, speaking each chip family's
