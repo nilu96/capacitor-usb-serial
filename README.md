@@ -144,6 +144,19 @@ Every rejection carries a stable `code`: `NO_DEVICE`, `NEEDS_PERMISSION`,
 `PERMISSION_DENIED`, `PORT_NOT_OPEN`, `INVALID_PARAMS`, `INVALID_STATE`, `IO_ERROR`,
 `DEVICE_DISCONNECTED`, `UNSUPPORTED_OPERATION`, `UNSUPPORTED_PLATFORM`.
 
+## Credits
+
+This plugin is a thin bridge — the genuinely hard part, talking to FTDI, Prolific,
+Silicon Labs, CH34x and CDC/ACM chips across a sea of quirky devices, is all
+[**usb-serial-for-android**](https://github.com/mik3y/usb-serial-for-android) by
+[Mike Wakerly (mik3y)](https://github.com/mik3y) and its contributors. Years of
+hard-won device compatibility live in that library; this package just hands it to
+Capacitor. Full credit for the underlying USB serial work goes to that project.
+
+`usb-serial-for-android` is MIT-licensed (© 2011–2013 Google Inc.; © 2013 Mike
+Wakerly). Full notice in [NOTICE](./NOTICE).
+
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE). Covers the bridge code in this repository;
+`usb-serial-for-android` remains under its own MIT license (see Credits above).
