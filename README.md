@@ -151,12 +151,14 @@ USB-serial work — [lee2dskies@gmail.com](mailto:lee2dskies@gmail.com).
 
 ## Credits
 
-This plugin is a thin bridge — the genuinely hard part, talking to FTDI, Prolific,
-Silicon Labs, CH34x and CDC/ACM chips across a sea of quirky devices, is all
+This plugin is a thin bridge — the genuinely hard part, speaking each chip family's
+proprietary protocol (FTDI's baud math, Prolific's finicky init sequences, the
+reverse-engineered CH340, Silicon Labs CP210x, CDC/ACM) and absorbing years of
+per-device bug fixes, is all
 [**usb-serial-for-android**](https://github.com/mik3y/usb-serial-for-android) by
-[Mike Wakerly (mik3y)](https://github.com/mik3y) and its contributors. Years of
-hard-won device compatibility live in that library; this package just hands it to
-Capacitor. Full credit for the underlying USB serial work goes to that project.
+[Mike Wakerly (mik3y)](https://github.com/mik3y) and its contributors. This package
+just hands that work to Capacitor. Full credit for the underlying USB serial work
+goes to that project.
 
 `usb-serial-for-android` is MIT-licensed (© 2011–2013 Google Inc.; © 2013 Mike
 Wakerly). Full notice in [NOTICE](./NOTICE).
