@@ -14,7 +14,6 @@
     "android/build.gradle",
     "dist/",
     "ios/Sources/",
-    "ios/Tests/",
     "Package.swift",
     "CapacitorUsbSerial.podspec"
   ],
