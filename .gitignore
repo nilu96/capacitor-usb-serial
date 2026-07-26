@@ -9,6 +9,10 @@ android/captures/
 android/local.properties
 .gradle/
 
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
 # Node / TS
 coverage/
 *.tsbuildinfo

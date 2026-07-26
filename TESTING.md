@@ -6,11 +6,15 @@ a manual hardware procedure that exercises real USB I/O (cannot be automated).
 ## Automated tests
 
 ```bash
-# TypeScript (web stub + contract)
+# TypeScript tests and package build
 npm test
+npm run verify:web
 
-# Android unit tests (helpers, mapping, handle store, bridge conversion)
-cd android && ./gradlew testDebugUnitTest
+# Android unit tests and library build
+npm run verify:android
+
+# iOS stub build against Capacitor 8 (macOS/Xcode only)
+npm run verify:ios
 ```
 
 Covered:
